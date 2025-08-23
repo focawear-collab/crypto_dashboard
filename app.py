@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 # =======================================================================
 # Crypto Daily Dashboard – Core Portfolio (2–3x Ready)
-# - Botón "Actualizar ahora" + selector de frecuencia (auto/diario/semanal/manual)
-# - Toggle "Forzar refetch" para romper caché de API/CDN
-# - Robustez frente a None/Null en CoinGecko (sin TypeError)
-# - Semáforos T1/T2/T3, split 50/50 BTC–USDT, DCA planner
-# - Macro rápidos (BTC Dominance, Fear & Greed)
-# - Derivados (Funding BTC, Open Interest Binance)
-# - Plotly con fallback si no está instalado
+# - Botón "Actualizar ahora", "Forzar refetch" anti-caché
+# - CoinGecko con retry/backoff + Fallback automático a Binance
+# - Manejo robusto de None/Null (sin TypeError)
+# - Semáforos T1/T2/T3, split 50/50 a BTC/USDT, DCA planner
+# - Macro rápidos (BTC Dominance, Fear & Greed), Derivados (Funding/OI)
+# - Plotly con fallback a tablas si no está instalado
 # =======================================================================
 
 import streamlit as st
@@ -15,9 +14,10 @@ import pandas as pd
 import requests
 from io import StringIO
 from datetime import datetime
-import time, uuid  # para romper caché cuando force_refetch=True
+import time, uuid
+import math
 
-# Plotly opcional (fallback a tabla si no está)
+# Plotly opcional
 try:
     import plotly.express as px
     PLOTLY_OK = True
@@ -49,9 +49,9 @@ elif update_mode == "Forzar semanal":
 else:
     st.sidebar.caption("Sin auto‑refresco. Usa el botón 🔄 para traer datos nuevos.")
 
-# --- Forzar refetch de APIs (romper caché de navegador/CDN) ---
 st.sidebar.markdown("—")
 force_refetch = st.sidebar.checkbox("💥 Forzar refetch de precios", value=False)
+use_binance_fallback = st.sidebar.checkbox("🛟 Usar fallback Binance si CG falla", value=True)
 
 st.title("📊 Crypto Daily – Core Portfolio (2–3x Ready)")
 st.caption(f"Última actualización: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -91,6 +91,13 @@ CG_IDS = {
     "BEAM":"beam","SUPER":"superverse","VIRTUAL":"virtuals-protocol"
 }
 
+# Mapa a símbolos spot en Binance (completa aquí si te falta alguno)
+BINANCE_SYMBOL = {
+    "BTC":"BTCUSDT","ETH":"ETHUSDT","SOL":"SOLUSDT","LINK":"LINKUSDT","AVAX":"AVAXUSDT",
+    "ADA":"ADAUSDT","NEAR":"NEARUSDT","SUI":"SUIUSDT","RAY":"RAYUSDT","ENA":"ENAUSDT",
+    "ONDO":"ONDOUSDT","USDT":"USDTUSDT"  # USDTUSDT no existe; se ignora
+}
+
 DEFAULT_CSV = """Token,Holdings,AvgCost
 ETH,9,245.52
 SUI,3300,1.19
@@ -112,56 +119,95 @@ USDT,5500,1
 """
 
 # ----------------------- HELPERS ROBUSTOS -------------------------------
-# @st.cache_data(ttl=300)
-def cg_simple_price(ids_joined: str, force: bool = False) -> dict:
-    """
-    Wrapper robusto para CoinGecko simple/price.
-    - Si force=True, agrega query params aleatorios y headers no-cache para romper caché.
-    """
-    base = "https://api.coingecko.com/api/v3/simple/price"
-    salt = f"&_ts={int(time.time())}&_={uuid.uuid4().hex}" if force else ""
-    url = (
-        f"{base}?ids={ids_joined}&vs_currencies=usd&include_24hr_change=true{salt}"
-    )
-    headers = {"Cache-Control": "no-cache"} if force else {}
-    try:
-        r = requests.get(url, timeout=15, headers=headers)
-        r.raise_for_status()
-        data = r.json()
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
 def _safe_float(x, default=0.0):
     try:
-        if x is None:
+        if x is None or (isinstance(x, str) and x.strip() == ""):
             return default
         return float(x)
     except Exception:
         return default
 
-# @st.cache_data(ttl=300)
-def fetch_prices(tokens, force: bool = False):
+def _req_json(url, headers=None, timeout=15, retries=3, backoff=0.8):
     """
-    Devuelve {SYM: {"price": float|None, "ch24": float}} robusto a faltantes.
-    Evita TypeError cuando CoinGecko responde con null o sin campo.
+    GET JSON con reintentos exponenciales. Evita lanzar excepción; retorna {} si falla.
+    """
+    headers = headers or {}
+    last_err = None
+    for i in range(retries):
+        try:
+            r = requests.get(url, timeout=timeout, headers=headers)
+            if r.status_code == 200:
+                return r.json()
+            # Si 429/5xx, backoff y reintentar
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(backoff * (2**i))
+                continue
+            # Otros códigos: no insistir
+            last_err = f"HTTP {r.status_code}"
+            break
+        except requests.RequestException as e:
+            last_err = str(e)
+            time.sleep(backoff * (2**i))
+    # Log ligero en pantalla para debug
+    st.info(f"⚠️ Falla al pedir {url.split('?')[0]} ({last_err}). Uso fallback si aplica.")
+    return {}
+
+# @st.cache_data(ttl=300)
+def cg_simple_price(ids_joined: str, force: bool = False) -> dict:
+    base = "https://api.coingecko.com/api/v3/simple/price"
+    salt = f"&_ts={int(time.time())}&_={uuid.uuid4().hex}" if force else ""
+    url = f"{base}?ids={ids_joined}&vs_currencies=usd&include_24hr_change=true{salt}"
+    headers = {"Cache-Control": "no-cache"} if force else {}
+    data = _req_json(url, headers=headers, timeout=15, retries=3, backoff=0.8)
+    return data if isinstance(data, dict) else {}
+
+def binance_ticker_24h(symbol: str) -> dict:
+    """
+    Fallback: precio y % cambio 24h desde Binance spot.
+    Devuelve {"price": float|None, "ch24": float} con ch24 en proporción (ej. 0.053 = 5.3%).
+    """
+    if not symbol or symbol.endswith("USDTUSDT"):
+        return {"price": None, "ch24": 0.0}
+    url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
+    data = _req_json(url, timeout=15, retries=3, backoff=0.8)
+    if not data or not isinstance(data, dict):
+        return {"price": None, "ch24": 0.0}
+    last_price = _safe_float(data.get("lastPrice"), default=None)
+    pct = _safe_float(data.get("priceChangePercent"), default=0.0) / 100.0
+    return {"price": last_price, "ch24": pct}
+
+# @st.cache_data(ttl=300)
+def fetch_prices(tokens, force: bool = False, use_fallback: bool = True):
+    """
+    Devuelve {SYM: {"price": float|None, "ch24": float}}.
+    1) Intenta CoinGecko por lotes (con anti-caché opcional).
+    2) Si falla/queda vacío para un símbolo, intenta Binance por símbolo.
     """
     ids = [CG_IDS[t] for t in tokens if t in CG_IDS]
-    if not ids:
-        return {}
     out = {}
-    BATCH = 50
-    inv = {v: k for k, v in CG_IDS.items()}
-    for i in range(0, len(ids), BATCH):
-        chunk = ids[i:i+BATCH]
-        data = cg_simple_price(",".join(chunk), force=force) or {}
-        for cid, payload in data.items():
-            sym = inv.get(cid)
-            if not sym:
-                continue
-            price = _safe_float(payload.get("usd"), default=None)   # puede quedar None
-            ch24 = _safe_float(payload.get("usd_24h_change"), default=0.0) / 100.0
-            out[sym] = {"price": price, "ch24": ch24}
+    # 1) CoinGecko por lotes
+    if ids:
+        BATCH = 50
+        inv = {v: k for k, v in CG_IDS.items()}
+        for i in range(0, len(ids), BATCH):
+            chunk = ids[i:i+BATCH]
+            data = cg_simple_price(",".join(chunk), force=force) or {}
+            for cid, payload in data.items():
+                sym = inv.get(cid)
+                if not sym:
+                    continue
+                price = _safe_float(payload.get("usd"), default=None)
+                ch24 = _safe_float(payload.get("usd_24h_change"), default=0.0) / 100.0
+                out[sym] = {"price": price, "ch24": ch24}
+
+    # 2) Fallback Binance por símbolo si falta precio o CG falló
+    if use_fallback:
+        for sym in tokens:
+            if sym not in out or out[sym].get("price") in (None, 0.0) or math.isnan(out[sym].get("price", 0.0)):
+                b_symbol = BINANCE_SYMBOL.get(sym)
+                if b_symbol:
+                    out[sym] = binance_ticker_24h(b_symbol)
+
     return out
 
 def get_btc_price(price_map: dict, manual: float|None = None) -> float|None:
@@ -170,8 +216,9 @@ def get_btc_price(price_map: dict, manual: float|None = None) -> float|None:
     maybe = price_map.get("BTC", {})
     if isinstance(maybe, dict) and maybe.get("price") is not None:
         return _safe_float(maybe.get("price"), default=None)
-    data = cg_simple_price("bitcoin", force=force_refetch)
-    return _safe_float(data.get("bitcoin", {}).get("usd"), default=None)
+    # Fallback directo a Binance si ni CG ni fetch_prices lo trajeron
+    fb = binance_ticker_24h("BTCUSDT")
+    return fb.get("price")
 
 def compute_mode(vol_map: dict, threshold=0.10):
     chs = [abs(v.get("ch24",0.0)) for v in vol_map.values() if isinstance(v, dict)]
@@ -250,37 +297,39 @@ def dca_table(total_usdt, ranges=(90000, 80000, 70000), weights=(0.3,0.4,0.3)):
 # -------------------- Macro quick: BTC.D + F&G --------------------------
 def fetch_btc_dominance():
     try:
-        resp = requests.get("https://api.coingecko.com/api/v3/global", timeout=15).json()
-        return float(resp["data"]["market_cap_percentage"]["btc"])
+        url = "https://api.coingecko.com/api/v3/global"
+        data = _req_json(url, timeout=15, retries=3, backoff=0.8)
+        return float(data.get("data", {}).get("market_cap_percentage", {}).get("btc"))
     except Exception:
         return None
 
 def fetch_fear_greed():
+    url = "https://api.alternative.me/fng/?limit=1"
+    data = _req_json(url, timeout=15, retries=3, backoff=0.8)
     try:
-        fg = requests.get("https://api.alternative.me/fng/?limit=1", timeout=15).json()
-        v = fg["data"][0]
+        v = data["data"][0]
         return int(v["value"]), v["value_classification"]
     except Exception:
         return None, None
 
 # --------------- Derivados básicos: Funding & Open Interest -------------
 def fetch_binance_funding(symbol="BTCUSDT"):
+    url = f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}&limit=1"
+    data = _req_json(url, timeout=15, retries=3, backoff=0.8)
     try:
-        url = f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}&limit=1"
-        r = requests.get(url, timeout=15).json()
-        if r:
-            fr = _safe_float(r[0].get("fundingRate"), default=None)
-            ts = int(r[0]["fundingTime"])
+        if isinstance(data, list) and data:
+            fr = _safe_float(data[0].get("fundingRate"), default=None)
+            ts = int(data[0]["fundingTime"])
             return fr, ts
     except Exception:
         pass
     return None, None
 
 def fetch_binance_oi_hist(symbol="BTCUSDT", period="1h", limit=48):
+    url = f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period={period}&limit={limit}"
+    data = _req_json(url, timeout=15, retries=3, backoff=0.8)
     try:
-        url = f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period={period}&limit={limit}"
-        r = requests.get(url, timeout=15).json()
-        df = pd.DataFrame(r)
+        df = pd.DataFrame(data)
         if not df.empty:
             df["sumOpenInterest"] = pd.to_numeric(df["sumOpenInterest"], errors="coerce")
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
@@ -308,21 +357,26 @@ split_btc = st.sidebar.slider("Split a BTC (%)", 0, 100, int(DEFAULT_SPLIT_TO_BT
 yb = st.sidebar.slider("Buffer semáforo (±%)", 0, 25, YELLOW_BUFFER_PCT)
 btc_manual = st.sidebar.number_input("Precio BTC (manual, opcional)", value=0.0, step=1000.0)
 
-# Precios (con toggle force_refetch)
+# Precios (con toggles)
 tokens = df["Token"].tolist()
 tokens_plus = tokens if "BTC" in tokens else tokens + ["BTC"]
-prices = fetch_prices(tokens_plus, force=force_refetch)
+prices = fetch_prices(tokens_plus, force=force_refetch, use_fallback=use_binance_fallback)
 
-# --- DEBUG rápido de actualización (ver 3 primeros tokens) ---
-sample = list(prices.items())[:3]
-st.caption(f"Debug precios (sample): {sample}")
+# Mensaje si usamos fallback
+if use_binance_fallback:
+    # Si alguno vino de Binance, price vendrá no-None aunque CG falló.
+    # No hay un flag por símbolo, pero mostramos aviso general.
+    st.info("🛟 Modo resiliente activo: si CoinGecko falla, uso precios y cambio 24h de Binance para completar datos.")
+
+# Debug rápido
+st.caption(f"Debug precios (sample): {list(prices.items())[:3]}")
 
 btc_price = get_btc_price(prices, btc_manual if btc_manual>0 else None)
 if not btc_price:
-    st.warning("No hay precio de BTC disponible (API). Uso 1.0 temporalmente para evitar errores en cálculos.")
+    st.warning("No hay precio de BTC disponible (APIs). Uso 1.0 temporalmente para evitar errores en cálculos.")
     btc_price = 1.0
 
-# Modo por volatilidad 24h (para referencia operativa)
+# Modo por volatilidad 24h
 mode, avg_abs = compute_mode(prices, threshold=0.10)
 
 # Señales + Totales
@@ -342,11 +396,10 @@ c7.metric("BTC por T3 (split)", f"{totals['BTC T3']:.3f}")
 
 # ======================= Macro quick ===================================
 btc_dom = fetch_btc_dominance()
-fg_val, fg_txt = st.columns(2)
-c8, c9 = fg_val, fg_txt
+c8,c9 = st.columns(2)
 c8.metric("BTC Dominance (%)", f"{btc_dom:.1f}" if btc_dom is not None else "—")
-val, txt = fetch_fear_greed()
-c9.metric("Fear & Greed", f"{val if val is not None else '—'} ({txt or '—'})")
+fg_val, fg_txt = fetch_fear_greed()
+c9.metric("Fear & Greed", f"{fg_val if fg_val is not None else '—'} ({fg_txt or '—'})")
 
 # ======================= Derivados =====================================
 st.markdown("### 🔗 Derivados (Binance Futures)")
@@ -417,4 +470,4 @@ if not dist.empty and PLOTLY_OK:
 elif not dist.empty:
     st.dataframe(dist, use_container_width=True)
 
-st.success("Dashboard listo: actualización manual, forzar refetch y manejo robusto de datos. 🚀")
+st.success("Dashboard listo: fallback a Binance activo, sin crashes por HTTPError. 🚀")
