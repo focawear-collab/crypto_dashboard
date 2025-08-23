@@ -2,6 +2,7 @@
 # =======================================================================
 # Crypto Daily Dashboard – Core Portfolio (2–3x Ready)
 # - Botón "Actualizar ahora" + selector de frecuencia (auto/diario/semanal/manual)
+# - Toggle "Forzar refetch" para romper caché de API/CDN
 # - Robustez frente a None/Null en CoinGecko (sin TypeError)
 # - Semáforos T1/T2/T3, split 50/50 BTC–USDT, DCA planner
 # - Macro rápidos (BTC Dominance, Fear & Greed)
@@ -14,6 +15,7 @@ import pandas as pd
 import requests
 from io import StringIO
 from datetime import datetime
+import time, uuid  # para romper caché cuando force_refetch=True
 
 # Plotly opcional (fallback a tabla si no está)
 try:
@@ -46,6 +48,10 @@ elif update_mode == "Forzar semanal":
     st.sidebar.caption("En calma; usa el botón para refrescar cuando quieras.")
 else:
     st.sidebar.caption("Sin auto‑refresco. Usa el botón 🔄 para traer datos nuevos.")
+
+# --- Forzar refetch de APIs (romper caché de navegador/CDN) ---
+st.sidebar.markdown("—")
+force_refetch = st.sidebar.checkbox("💥 Forzar refetch de precios", value=False)
 
 st.title("📊 Crypto Daily – Core Portfolio (2–3x Ready)")
 st.caption(f"Última actualización: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -107,13 +113,19 @@ USDT,5500,1
 
 # ----------------------- HELPERS ROBUSTOS -------------------------------
 # @st.cache_data(ttl=300)
-def cg_simple_price(ids_joined: str) -> dict:
+def cg_simple_price(ids_joined: str, force: bool = False) -> dict:
+    """
+    Wrapper robusto para CoinGecko simple/price.
+    - Si force=True, agrega query params aleatorios y headers no-cache para romper caché.
+    """
+    base = "https://api.coingecko.com/api/v3/simple/price"
+    salt = f"&_ts={int(time.time())}&_={uuid.uuid4().hex}" if force else ""
     url = (
-        "https://api.coingecko.com/api/v3/simple/price"
-        f"?ids={ids_joined}&vs_currencies=usd&include_24hr_change=true"
+        f"{base}?ids={ids_joined}&vs_currencies=usd&include_24hr_change=true{salt}"
     )
+    headers = {"Cache-Control": "no-cache"} if force else {}
     try:
-        r = requests.get(url, timeout=15)
+        r = requests.get(url, timeout=15, headers=headers)
         r.raise_for_status()
         data = r.json()
         return data if isinstance(data, dict) else {}
@@ -129,7 +141,7 @@ def _safe_float(x, default=0.0):
         return default
 
 # @st.cache_data(ttl=300)
-def fetch_prices(tokens):
+def fetch_prices(tokens, force: bool = False):
     """
     Devuelve {SYM: {"price": float|None, "ch24": float}} robusto a faltantes.
     Evita TypeError cuando CoinGecko responde con null o sin campo.
@@ -142,7 +154,7 @@ def fetch_prices(tokens):
     inv = {v: k for k, v in CG_IDS.items()}
     for i in range(0, len(ids), BATCH):
         chunk = ids[i:i+BATCH]
-        data = cg_simple_price(",".join(chunk)) or {}
+        data = cg_simple_price(",".join(chunk), force=force) or {}
         for cid, payload in data.items():
             sym = inv.get(cid)
             if not sym:
@@ -158,7 +170,7 @@ def get_btc_price(price_map: dict, manual: float|None = None) -> float|None:
     maybe = price_map.get("BTC", {})
     if isinstance(maybe, dict) and maybe.get("price") is not None:
         return _safe_float(maybe.get("price"), default=None)
-    data = cg_simple_price("bitcoin")
+    data = cg_simple_price("bitcoin", force=force_refetch)
     return _safe_float(data.get("bitcoin", {}).get("usd"), default=None)
 
 def compute_mode(vol_map: dict, threshold=0.10):
@@ -296,10 +308,14 @@ split_btc = st.sidebar.slider("Split a BTC (%)", 0, 100, int(DEFAULT_SPLIT_TO_BT
 yb = st.sidebar.slider("Buffer semáforo (±%)", 0, 25, YELLOW_BUFFER_PCT)
 btc_manual = st.sidebar.number_input("Precio BTC (manual, opcional)", value=0.0, step=1000.0)
 
-# Precios
+# Precios (con toggle force_refetch)
 tokens = df["Token"].tolist()
 tokens_plus = tokens if "BTC" in tokens else tokens + ["BTC"]
-prices = fetch_prices(tokens_plus)
+prices = fetch_prices(tokens_plus, force=force_refetch)
+
+# --- DEBUG rápido de actualización (ver 3 primeros tokens) ---
+sample = list(prices.items())[:3]
+st.caption(f"Debug precios (sample): {sample}")
 
 btc_price = get_btc_price(prices, btc_manual if btc_manual>0 else None)
 if not btc_price:
@@ -326,10 +342,11 @@ c7.metric("BTC por T3 (split)", f"{totals['BTC T3']:.3f}")
 
 # ======================= Macro quick ===================================
 btc_dom = fetch_btc_dominance()
-fg_val, fg_txt = fetch_fear_greed()
-c8,c9 = st.columns(2)
+fg_val, fg_txt = st.columns(2)
+c8, c9 = fg_val, fg_txt
 c8.metric("BTC Dominance (%)", f"{btc_dom:.1f}" if btc_dom is not None else "—")
-c9.metric("Fear & Greed", f"{fg_val if fg_val is not None else '—'} ({fg_txt or '—'})")
+val, txt = fetch_fear_greed()
+c9.metric("Fear & Greed", f"{val if val is not None else '—'} ({txt or '—'})")
 
 # ======================= Derivados =====================================
 st.markdown("### 🔗 Derivados (Binance Futures)")
@@ -400,4 +417,4 @@ if not dist.empty and PLOTLY_OK:
 elif not dist.empty:
     st.dataframe(dist, use_container_width=True)
 
-st.success("Dashboard listo con actualización manual y manejo robusto de datos. 🚀")
+st.success("Dashboard listo: actualización manual, forzar refetch y manejo robusto de datos. 🚀")
