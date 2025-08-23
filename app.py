@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 # =======================================================================
 # Crypto Daily Dashboard – Core Portfolio (2–3x Ready)
+# - Botón "Actualizar ahora" + selector de frecuencia (auto/diario/semanal/manual)
 # - Robustez frente a None/Null en CoinGecko (sin TypeError)
 # - Semáforos T1/T2/T3, split 50/50 BTC–USDT, DCA planner
 # - Macro rápidos (BTC Dominance, Fear & Greed)
 # - Derivados (Funding BTC, Open Interest Binance)
-# - Plotly con fallback seguro si no está instalado
+# - Plotly con fallback si no está instalado
 # =======================================================================
 
 import streamlit as st
@@ -22,6 +23,33 @@ except Exception:
     PLOTLY_OK = False
 
 st.set_page_config(page_title="Crypto Daily – Core Portfolio", layout="wide")
+
+# ------------------ CONTROLES DE ACTUALIZACIÓN -------------------------
+st.sidebar.markdown("## 🔄 Actualización")
+if st.sidebar.button("🔄 Actualizar ahora"):
+    # Si usas @st.cache_data, esto fuerza datos frescos
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    st.rerun()
+
+update_mode = st.sidebar.radio(
+    "Frecuencia preferida",
+    ["Auto (según volatilidad)", "Forzar diario", "Forzar semanal", "Solo manual"],
+    index=0
+)
+if update_mode == "Auto (según volatilidad)":
+    st.sidebar.caption("Usa el semáforo de volatilidad (DIARIO/SEMANAL) como guía operativa.")
+elif update_mode == "Forzar diario":
+    st.sidebar.caption("En días de alta volatilidad; usa el botón para refrescar cuando quieras.")
+elif update_mode == "Forzar semanal":
+    st.sidebar.caption("En calma; usa el botón para refrescar cuando quieras.")
+else:
+    st.sidebar.caption("Sin auto‑refresco. Usa el botón 🔄 para traer datos nuevos.")
+
+st.title("📊 Crypto Daily – Core Portfolio (2–3x Ready)")
+st.caption(f"Última actualización: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # ----------------------- CONFIG ----------------------------------------
 DEFAULT_TRANCHES = [0.25, 0.35, 0.40]   # T1/T2/T3
@@ -82,6 +110,8 @@ USDT,5500,1
 """
 
 # ----------------------- HELPERS (ROBUSTOS) -----------------------------
+# Puedes activar caching si deseas (ej. 5 min) descomentando @st.cache_data
+# @st.cache_data(ttl=300)
 def cg_simple_price(ids_joined: str) -> dict:
     """Wrapper robusto para CoinGecko simple/price."""
     url = (
@@ -102,6 +132,7 @@ def _safe_float(x, default=0.0):
     except Exception:
         return default
 
+# @st.cache_data(ttl=300)
 def fetch_prices(tokens):
     """
     Devuelve {SYM: {"price": float|None, "ch24": float}} robusto a faltantes.
@@ -172,7 +203,6 @@ def compute_signals(df, prices, targets, btc_price, tranches, split_btc, yellow_
         def tranche_calc(q, target):
             if (q is None) or (target is None): return (None,None,None)
             usd = q * target
-            # si btc_price None, evitamos división
             btc = (usd * split_btc) / btc_price if btc_price else None
             usdt = usd * (1 - split_btc)
             return (usd, usdt, btc)
@@ -256,11 +286,7 @@ def fetch_binance_oi_hist(symbol="BTCUSDT", period="1h", limit=48):
         pass
     return pd.DataFrame()
 
-# =========================== UI ========================================
-st.title("📊 Crypto Daily – Core Portfolio (2–3x Ready)")
-st.caption(f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-# Cargar CSV
+# =========================== CARGA DE DATOS =============================
 st.sidebar.header("📥 Portafolio")
 up = st.sidebar.file_uploader("Sube CSV (Token,Holdings,AvgCost)", type=["csv"])
 csv_text = up.read().decode("utf-8") if up else DEFAULT_CSV
@@ -288,7 +314,7 @@ if not btc_price:
     st.warning("No hay precio de BTC disponible (API). Uso 1.0 temporalmente para evitar errores en cálculos.")
     btc_price = 1.0
 
-# Modo por volatilidad 24h
+# Modo por volatilidad 24h (para referencia operativa)
 mode, avg_abs = compute_mode(prices, threshold=0.10)
 
 # Señales + Totales
@@ -371,27 +397,15 @@ with c13:
         st.metric("BTC comprable total (DCA)", f"{dca_df.loc['TOTAL','BTC Comprable']:.3f}")
 
 # ======================= Distribución por token =========================
-st.markdown("### 🧩 Distribución por token (USD)")
+st.markdown("### 🧩 Distribución por Token (USD)")
 dist = signals[["Token","ValorUSD"]].dropna().sort_values("ValorUSD", ascending=False)
 if not dist.empty and PLOTLY_OK:
-    fig = None
     try:
         fig = px.bar(dist, x="Token", y="ValorUSD", title="Distribución por Token (USD)")
-    except Exception:
-        fig = None
-    if fig is not None:
         st.plotly_chart(fig, use_container_width=True)
+    except Exception:
+        st.dataframe(dist, use_container_width=True)
 elif not dist.empty:
     st.dataframe(dist, use_container_width=True)
 
-st.success("Listo. Dashboard robusto activo. Si CoinGecko devuelve null en 24h_change o precios, el panel sigue funcionando sin caerse. 🚀")
-# === Controles de actualización ===
-st.sidebar.markdown("## 🔄 Actualización")
-if st.sidebar.button("🔄 Actualizar ahora"):
-    # Si en algún punto usas @st.cache_data, esto limpia el caché
-    try:
-        st.cache_data.clear()
-    except Exception:
-        pass
-    st.rerun()
-
+st.success("Dashboard listo con botón de actualización manual y frecuencia preferida. 🚀")
