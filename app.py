@@ -385,3 +385,13 @@ elif not dist.empty:
     st.dataframe(dist, use_container_width=True)
 
 st.success("Listo. Dashboard robusto activo. Si CoinGecko devuelve null en 24h_change o precios, el panel sigue funcionando sin caerse. 🚀")
+# === Controles de actualización ===
+st.sidebar.markdown("## 🔄 Actualización")
+if st.sidebar.button("🔄 Actualizar ahora"):
+    # Si en algún punto usas @st.cache_data, esto limpia el caché
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    st.rerun()
+
