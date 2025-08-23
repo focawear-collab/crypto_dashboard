@@ -27,7 +27,6 @@ st.set_page_config(page_title="Crypto Daily – Core Portfolio", layout="wide")
 # ------------------ CONTROLES DE ACTUALIZACIÓN -------------------------
 st.sidebar.markdown("## 🔄 Actualización")
 if st.sidebar.button("🔄 Actualizar ahora"):
-    # Si usas @st.cache_data, esto fuerza datos frescos
     try:
         st.cache_data.clear()
     except Exception:
@@ -56,7 +55,6 @@ DEFAULT_TRANCHES = [0.25, 0.35, 0.40]   # T1/T2/T3
 DEFAULT_SPLIT_TO_BTC = 0.50             # 50% BTC / 50% USDT
 YELLOW_BUFFER_PCT = 10                  # "cerca de" target (±10%)
 
-# Targets por token (ajusta a gusto)
 TARGETS = {
     "ETH": [4900, 8000, 10000],
     "LINK": [50, 75, 100],
@@ -78,7 +76,6 @@ TARGETS = {
     "BTC":  [None, None, None],
 }
 
-# CoinGecko IDs
 CG_IDS = {
     "BTC":"bitcoin",
     "ETH":"ethereum","SUI":"sui","LINK":"chainlink","RAY":"raydium",
@@ -88,7 +85,6 @@ CG_IDS = {
     "BEAM":"beam","SUPER":"superverse","VIRTUAL":"virtuals-protocol"
 }
 
-# CSV base (puedes sobrescribirlo en la app)
 DEFAULT_CSV = """Token,Holdings,AvgCost
 ETH,9,245.52
 SUI,3300,1.19
@@ -109,22 +105,22 @@ ONDO,7000,0.8559
 USDT,5500,1
 """
 
-# ----------------------- HELPERS (ROBUSTOS) -----------------------------
-# Puedes activar caching si deseas (ej. 5 min) descomentando @st.cache_data
+# ----------------------- HELPERS ROBUSTOS -------------------------------
 # @st.cache_data(ttl=300)
 def cg_simple_price(ids_joined: str) -> dict:
-    """Wrapper robusto para CoinGecko simple/price."""
     url = (
         "https://api.coingecko.com/api/v3/simple/price"
         f"?ids={ids_joined}&vs_currencies=usd&include_24hr_change=true"
     )
-    r = requests.get(url, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    return data if isinstance(data, dict) else {}
+    try:
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 def _safe_float(x, default=0.0):
-    """Convierte a float tolerando None y strings no numéricas."""
     try:
         if x is None:
             return default
@@ -136,44 +132,38 @@ def _safe_float(x, default=0.0):
 def fetch_prices(tokens):
     """
     Devuelve {SYM: {"price": float|None, "ch24": float}} robusto a faltantes.
-    Divide en lotes por si hay rate-limit y evita TypeError en None.
+    Evita TypeError cuando CoinGecko responde con null o sin campo.
     """
     ids = [CG_IDS[t] for t in tokens if t in CG_IDS]
     if not ids:
         return {}
-
     out = {}
     BATCH = 50
     inv = {v: k for k, v in CG_IDS.items()}
-
     for i in range(0, len(ids), BATCH):
         chunk = ids[i:i+BATCH]
-        data = cg_simple_price(",".join(chunk))
-        for cid, payload in (data or {}).items():
+        data = cg_simple_price(",".join(chunk)) or {}
+        for cid, payload in data.items():
             sym = inv.get(cid)
             if not sym:
                 continue
-            price = _safe_float(payload.get("usd"), default=None)   # None => sin precio
-            ch_raw = payload.get("usd_24h_change", 0.0)             # puede venir None
-            ch24 = _safe_float(ch_raw, default=0.0) / 100.0
+            price = _safe_float(payload.get("usd"), default=None)   # puede quedar None
+            ch24 = _safe_float(payload.get("usd_24h_change"), default=0.0) / 100.0
             out[sym] = {"price": price, "ch24": ch24}
-
     return out
 
 def get_btc_price(price_map: dict, manual: float|None = None) -> float|None:
     if manual and manual > 0:
         return manual
-    if "BTC" in price_map and price_map["BTC"].get("price"):
-        return float(price_map["BTC"]["price"])
-    try:
-        data = cg_simple_price("bitcoin")
-        return _safe_float(data.get("bitcoin", {}).get("usd"), default=None)
-    except Exception:
-        return None
+    maybe = price_map.get("BTC", {})
+    if isinstance(maybe, dict) and maybe.get("price") is not None:
+        return _safe_float(maybe.get("price"), default=None)
+    data = cg_simple_price("bitcoin")
+    return _safe_float(data.get("bitcoin", {}).get("usd"), default=None)
 
 def compute_mode(vol_map: dict, threshold=0.10):
-    chs = [abs(v.get("ch24",0.0)) for v in vol_map.values() if "ch24" in v]
-    avg_abs = sum(chs)/len(chs) if chs else 0.0
+    chs = [abs(v.get("ch24",0.0)) for v in vol_map.values() if isinstance(v, dict)]
+    avg_abs = (sum(chs)/len(chs)) if chs else 0.0
     return ("DIARIO" if avg_abs >= threshold else "SEMANAL", avg_abs)
 
 def compute_signals(df, prices, targets, btc_price, tranches, split_btc, yellow_pct):
@@ -181,8 +171,9 @@ def compute_signals(df, prices, targets, btc_price, tranches, split_btc, yellow_
     rows = []
     for _, r in df.iterrows():
         sym = r["Token"]; hold = float(r["Holdings"]); avg = float(r["AvgCost"])
-        price = prices.get(sym, {}).get("price")
-        ch24  = prices.get(sym, {}).get("ch24", 0.0)
+        meta = prices.get(sym, {}) if isinstance(prices.get(sym, {}), dict) else {}
+        price = meta.get("price")
+        ch24  = meta.get("ch24", 0.0)
         t1,t2,t3 = (targets.get(sym, [None,None,None]) + [None,None,None])[:3]
 
         val = price*hold if price is not None else None
@@ -203,7 +194,7 @@ def compute_signals(df, prices, targets, btc_price, tranches, split_btc, yellow_
         def tranche_calc(q, target):
             if (q is None) or (target is None): return (None,None,None)
             usd = q * target
-            btc = (usd * split_btc) / btc_price if btc_price else None
+            btc = (usd * split_btc) / btc_price if (btc_price and btc_price>0) else None
             usdt = usd * (1 - split_btc)
             return (usd, usdt, btc)
 
@@ -238,7 +229,7 @@ def dca_table(total_usdt, ranges=(90000, 80000, 70000), weights=(0.3,0.4,0.3)):
     rows = []
     for p,w in zip(ranges,weights):
         usd = total_usdt*w
-        btc = usd/p if p else 0
+        btc = (usd/p) if p else 0
         rows.append({"BTC Price": int(p), "USDT": round(usd,2), "BTC Comprable": btc})
     df = pd.DataFrame(rows)
     df.loc["TOTAL"] = {"BTC Price":"—","USDT":df["USDT"].sum(),"BTC Comprable":df["BTC Comprable"].sum()}
@@ -292,6 +283,7 @@ up = st.sidebar.file_uploader("Sube CSV (Token,Holdings,AvgCost)", type=["csv"])
 csv_text = up.read().decode("utf-8") if up else DEFAULT_CSV
 with st.expander("Ver/editar CSV (opcional)"):
     csv_text = st.text_area("CSV", value=csv_text, height=220)
+
 df = pd.read_csv(StringIO(csv_text))
 df["Token"] = df["Token"].str.upper().str.strip()
 df["Holdings"] = pd.to_numeric(df["Holdings"], errors="coerce").fillna(0.0)
@@ -408,4 +400,4 @@ if not dist.empty and PLOTLY_OK:
 elif not dist.empty:
     st.dataframe(dist, use_container_width=True)
 
-st.success("Dashboard listo con botón de actualización manual y frecuencia preferida. 🚀")
+st.success("Dashboard listo con actualización manual y manejo robusto de datos. 🚀")
